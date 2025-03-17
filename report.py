@@ -1,12 +1,10 @@
 import json
 import sys
 import os
-from pathlib import Path
 
 from color import Colors
 
-
-def generate_colored_report(source_file, coverage_data, use_colors=True):
+def generate_colored_report(source_file, coverage_data, use_colors=True) -> str:
     # read source file
     with open(source_file, "r") as f:
         source_lines = f.readlines()

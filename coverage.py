@@ -5,7 +5,7 @@ import json
 import atexit
 from pathlib import Path
 from abc import ABC, abstractmethod
-from typing import Dict, Set, Tuple, Any, List, Optional
+from typing import Dict, Set, Tuple, List
 
 
 class CoverageData:
@@ -46,6 +46,26 @@ class CoverageData:
         else:
             branch_data[branch_key]["not_taken"] += 1
 
+    def mark_condition(
+        self, filename: str, line_number: int, cond_id: str, value: bool
+    ) -> None:
+        """Mark a condition as true or false"""
+        if filename not in self.data:
+            self.data[filename] = {}
+
+        if "conditions" not in self.data[filename]:
+            self.data[filename]["conditions"] = {}
+
+        # condition key => "12_condA" form
+        cond_key = f"{line_number}_{cond_id}"
+        if cond_key not in self.data[filename]["conditions"]:
+            self.data[filename]["conditions"][cond_key] = {"true": 0, "false": 0}
+
+        if value:
+            self.data[filename]["conditions"][cond_key]["true"] += 1
+        else:
+            self.data[filename]["conditions"][cond_key]["false"] += 1
+
     def get_data(self) -> Dict:
         """Get the current coverage data"""
         return self.data
@@ -83,6 +103,12 @@ class CoverageTracker:
     ) -> None:
         """Mark a branch as taken or not taken (for future branch coverage)"""
         self.coverage_data.mark_branch(filename, line_number, branch_id, taken)
+
+    def mark_condition(
+        self, filename: str, line_number: int, cond_id: str, value: bool
+    ) -> None:
+        """Mark a condition as true or false"""
+        self.coverage_data.mark_condition(filename, line_number, cond_id, value)
 
     def save_coverage_data(self, output_file: str = ".coverage_data.json") -> None:
         """Save coverage data to a file"""
@@ -190,6 +216,80 @@ class BranchInstrumentationStrategy(InstrumentationStrategy):
     def get_instrumented_elements(self) -> Set[str]:
         return self.instrumented_branches
 
+class ConditionInstrumentationStrategy(InstrumentationStrategy):
+    """
+    Strategy for condition coverage instrumentation.
+    It replaces 'and/or' bool ops with calls to _cov_and/_cov_or,
+    so that each operand is marked separately for True/False.
+    """
+
+    def __init__(self, filename: str):
+        super().__init__(filename)
+        self.instrument_conditions = set()
+        self.condition_counter = 0
+
+    def instrument_node(self, node: ast.AST) -> List[ast.AST]:
+        if isinstance(node, ast.BoolOp):
+            return [self._transform_boolop(node)]
+        return [node]
+
+    def _transform_boolop(self, node: ast.BoolOp) -> ast.AST:
+        """
+        Replace 'and/or' bool ops with calls to _cov_and/_cov_or,
+        so that each operand is marked separately for True/False.
+        """
+        line_num = getattr(node, "lineno", None)
+        if line_num is None:
+            return node # impossible to instrument
+
+        is_and = isinstance(node.op, ast.And)
+
+        # node.values = [expr1, expr2, expr3] like this, multiple expressions can be included
+        # In cases where "and", "or" are consecutively attached: (expr1 and expr2 and expr3)
+        # Convert by grouping them from left to right with *cov*and(...) 
+        # Finally, create a single expression (node).
+        return self._transform_boolop_values(node.values, line_num, is_and)
+
+    def _transform_boolop_values(self, values: List[ast.AST], line_num: int, is_and: bool) -> ast.AST:
+        """
+        Combine the values list from left to right
+        while replacing with *cov*and(...) or *cov*or(...)
+        Example) a and b and c => *cov*and(a, *cov*and(b, c))
+        """
+        if len(values) == 1:
+            return values[0] # no need to wrap
+        
+        left = values[0]
+        right = self._transform_boolop_values(values[1:], line_num, is_and)
+
+        # create new condition ID
+        cond_left_id = f"cond_{self.condition_counter}"
+        self.condition_counter += 1
+        cond_right_id = f"cond_{self.condition_counter}"
+        self.condition_counter += 1
+
+        self.instrumented_conditions.add(cond_left_id)
+        self.instrumented_conditions.add(cond_right_id)
+
+        func_name = "_cov_and" if is_and else "_cov_or"
+        # _cov_and(left, right, filename, line_num, cond_left_id, cond_right_id, _coverage_tracker)
+        call_node = ast.Call(
+            func=ast.Name(id=func_name, ctx=ast.Load()),
+            args=[
+                left,
+                right,
+                ast.Constant(value=self.filename),
+                ast.Constant(value=line_num),
+                ast.Constant(value=cond_left_id),
+                ast.Constant(value=cond_right_id),
+                ast.Name(id="_coverage_tracker", ctx=ast.Load()),
+            ],
+            keywords=[],
+        )
+        return call_node
+
+    def get_instrumented_elements(self) -> Set[str]:
+        return self.instrumented_conditions
 
 class CoverageInstrumenter(ast.NodeTransformer):
     """AST transformer to add coverage instrumentation"""
@@ -397,22 +497,38 @@ class CoverageEngine:
             f.write("# Package initialization file")
 
     def _create_coverage_tracker_module(self) -> None:
-        """Create the coverage tracker module in the output directory"""
         with open(f"{self.output_dir}/coverage_tracker.py", "w") as f:
             f.write(
-                """
+                '''
 import json
 import atexit
-from typing import Dict, Optional
+from typing import Dict
 
 class CoverageData:
-    \"\"\"Class to store and manage coverage data\"\"\"
-    
+    """
+    Class to store and manage coverage data.
+    This includes line, branch, and condition coverage.
+    """
     def __init__(self):
+        # The structure of self.data is:
+        # {
+        #   "<filename>": {
+        #       "lines": { <line_number>: execution_count, ... },
+        #       "branches": {
+        #           "<lineNum>_<branchId>": {"taken": int, "not_taken": int},
+        #           ...
+        #       },
+        #       "conditions": {
+        #           "<lineNum>_<condId>": {"true": int, "false": int},
+        #           ...
+        #       }
+        #   },
+        #   ...
+        # }
         self.data = {}
-        
+    
     def mark_line(self, filename: str, line_number: int) -> None:
-        \"\"\"Mark a line as executed\"\"\"
+        """Mark a line as executed."""
         if filename not in self.data:
             self.data[filename] = {}
         
@@ -423,7 +539,10 @@ class CoverageData:
         line_data[line_number] = line_data.get(line_number, 0) + 1
     
     def mark_branch(self, filename: str, line_number: int, branch_id: str, taken: bool) -> None:
-        \"\"\"Mark a branch as taken or not taken\"\"\"
+        """
+        Mark a branch as taken or not taken.
+        e.g. for an 'if' statement, True branch / False branch
+        """
         if filename not in self.data:
             self.data[filename] = {}
             
@@ -440,20 +559,43 @@ class CoverageData:
             branch_data[branch_key]['taken'] += 1
         else:
             branch_data[branch_key]['not_taken'] += 1
+
+    def mark_condition(self, filename: str, line_number: int, cond_id: str, value: bool) -> None:
+        """
+        Mark a sub-condition in a complex boolean expression as True or False.
+        This is used for condition coverage.
+        """
+        if filename not in self.data:
+            self.data[filename] = {}
+
+        if 'conditions' not in self.data[filename]:
+            self.data[filename]['conditions'] = {}
+        
+        condition_key = f"{line_number}_{cond_id}"
+        if condition_key not in self.data[filename]['conditions']:
+            self.data[filename]['conditions'][condition_key] = {'true': 0, 'false': 0}
+        
+        if value:
+            self.data[filename]['conditions'][condition_key]['true'] += 1
+        else:
+            self.data[filename]['conditions'][condition_key]['false'] += 1
     
     def get_data(self) -> Dict:
-        \"\"\"Get the current coverage data\"\"\"
+        """Get the current coverage data."""
         return self.data
     
     def save(self, output_file: str = ".coverage_data.json") -> None:
-        \"\"\"Save coverage data to a file\"\"\"
+        """Save coverage data to a file in JSON format."""
         with open(output_file, 'w') as f:
             json.dump(self.data, f, indent=2)
         print(f"Coverage data saved to {output_file}")
 
 
 class CoverageTracker:
-    \"\"\"Singleton class to track coverage during program execution\"\"\"
+    """
+    Singleton class to track coverage during program execution.
+    Provides mark_line, mark_branch, mark_condition methods.
+    """
     _instance = None
     
     def __new__(cls):
@@ -463,32 +605,59 @@ class CoverageTracker:
         return cls._instance
     
     def _initialize(self) -> None:
-        \"\"\"Initialize the coverage tracker\"\"\"
+        """Initialize the coverage tracker"""
         self.coverage_data = CoverageData()
         # Register the save method to run when Python exits
         atexit.register(self.save_coverage_data)
     
     def mark_line(self, filename: str, line_number: int) -> None:
-        \"\"\"Mark a line as executed\"\"\"
+        """Mark a line as executed."""
         self.coverage_data.mark_line(filename, line_number)
     
     def mark_branch(self, filename: str, line_number: int, branch_id: str, taken: bool) -> None:
-        \"\"\"Mark a branch as taken or not taken\"\"\"
+        """Mark a branch as taken or not taken."""
         self.coverage_data.mark_branch(filename, line_number, branch_id, taken)
     
+    def mark_condition(self, filename: str, line_number: int, cond_id: str, value: bool) -> None:
+        """Mark a condition as True or False."""
+        self.coverage_data.mark_condition(filename, line_number, cond_id, value)
+    
     def save_coverage_data(self, output_file: str = ".coverage_data.json") -> None:
-        \"\"\"Save coverage data to a file\"\"\"
+        """Save coverage data to a file (triggered at process exit)."""
         self.coverage_data.save(output_file)
     
     def get_coverage_data(self) -> Dict:
-        \"\"\"Get the current coverage data\"\"\"
+        """Return the aggregated coverage data."""
         return self.coverage_data.get_data()
 
 
-# Create a global instance that will be imported
+def _cov_and(left, right, filename, line_number, cond_left_id, cond_right_id, tracker):
+    """
+    Short-circuit logic for 'and' with condition coverage.
+    Mark the left condition first, then only evaluate right if left is True.
+    """
+    tracker.mark_condition(filename, line_number, cond_left_id, left)
+    if not left:
+        return False
+    tracker.mark_condition(filename, line_number, cond_right_id, right)
+    return left and right
+
+def _cov_or(left, right, filename, line_number, cond_left_id, cond_right_id, tracker):
+    """
+    Short-circuit logic for 'or' with condition coverage.
+    Mark the left condition first, then only evaluate right if left is False.
+    """
+    tracker.mark_condition(filename, line_number, cond_left_id, left)
+    if left:
+        return True
+    tracker.mark_condition(filename, line_number, cond_right_id, right)
+    return left or right
+
+# Create a global instance that will be imported by instrumented code
 _coverage_tracker = CoverageTracker()
-"""
-            )
+'''
+        )
+
 
     def instrument_file(
         self, file_path: str, strategies: List[str] = None
@@ -509,6 +678,7 @@ _coverage_tracker = CoverageTracker()
         available_strategies = {
             "line": LineInstrumentationStrategy(path_str),
             "branch": BranchInstrumentationStrategy(path_str),
+            "condition": ConditionInstrumentationStrategy(path_str),
         }
 
         selected_strategies = []
