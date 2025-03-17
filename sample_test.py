@@ -41,6 +41,7 @@ def is_prime(n):
 if __name__ == "__main__":
     print("Calculating factorial of 5:", factorial(5))
     print("Calculating 7th Fibonacci number:", fibonacci(7))
+    print("negative number:", factorial(-1))
 
     print("Is 1, 2, 3 prime?")
     for i in range(1, 4):
@@ -51,5 +52,7 @@ if __name__ == "__main__":
     x = 10
     if x > 5:
         print("x is greater than 5")
+        if x == 10:
+            print("x is 10")
     else:
         print("x is not greater than 5")

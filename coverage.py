@@ -108,6 +108,11 @@ class InstrumentationStrategy(ABC):
         """Instrument a node for coverage tracking"""
         pass
 
+    @abstractmethod
+    def get_instrumented_elements(self) -> Set[int]:
+        """Get the set of line numbers that were instrumented"""
+        pass
+
 
 class LineInstrumentationStrategy(InstrumentationStrategy):
     """Strategy for line coverage instrumentation"""
@@ -134,7 +139,6 @@ class LineInstrumentationStrategy(InstrumentationStrategy):
         return [node]
 
     def get_instrumented_elements(self) -> Set[int]:
-        """Get the set of line numbers that were instrumented"""
         return self.instrumented_lines
 
 
@@ -147,13 +151,43 @@ class BranchInstrumentationStrategy(InstrumentationStrategy):
         self.branch_counter = 0
 
     def instrument_node(self, node: ast.AST) -> List[ast.AST]:
-        """Add instrumentation to mark branches (placeholder)"""
-        # This is a placeholder for future branch coverage implementation
-        # Will be expanded when branch coverage is added
+        """Add instrumentation to mark branches"""
+        if isinstance(node, ast.If):
+            branch_id = f"branch_{self.branch_counter}"
+            self.branch_counter += 1
+            self.instrumented_branches.add(branch_id)
+
+            line_num = getattr(node, "lineno", None)
+
+            # call mark_branch when going to the `True` branch
+            mark_true = ast.parse(
+                f"_coverage_tracker.mark_branch('{self.filename}', {line_num}, '{branch_id}', True)"
+            ).body[0]
+
+            # call mark_branch when going to the `False` branch
+            mark_false = ast.parse(
+                f"_coverage_tracker.mark_branch('{self.filename}', {line_num}, '{branch_id}', False)"
+            ).body[0]
+
+            # replace the original if statement:
+            #
+            # if node.test:
+            #     mark_branch( ... True )
+            #     (previous body)
+            # else:
+            #     mark_branch( ... False )
+            #     (previous orelse)
+            new_if = ast.If(
+                test=node.test,
+                body=[mark_true] + node.body,
+                orelse=[mark_false] + node.orelse,
+            )
+            return [new_if]
+
+        # returning without modifications for other node types
         return [node]
 
     def get_instrumented_elements(self) -> Set[str]:
-        """Get the set of branch ids that were instrumented"""
         return self.instrumented_branches
 
 
@@ -234,17 +268,24 @@ class CoverageInstrumenter(ast.NodeTransformer):
         """Visit an if statement"""
         self.generic_visit(node)
 
-        instrumentation_nodes = []
         for strategy in self.strategies:
-            if hasattr(node, "lineno"):
-                new_nodes = strategy.instrument_node(node)
-                # Add all but the last item (which is the original node)
-                instrumentation_nodes.extend(new_nodes[:-1])
+            new_nodes = strategy.instrument_node(node)
 
-        # Make sure the body and orelse parts are properly instrumented
-        return ast.If(
-            test=node.test, body=instrumentation_nodes + node.body, orelse=node.orelse
-        )
+            if len(new_nodes) == 1:
+                # treat as a final node
+                node = new_nodes[0]
+            else:
+                # if it's like [tracker_call, node] for line instrumentation,
+                # the last element is the actual original node, so set that as the final node.
+                # Also, handle the rest by attaching them to the front of `node.body`
+                instrumentation_nodes = new_nodes[:-1]
+                original_node = new_nodes[-1]
+                if isinstance(original_node, ast.If):
+                    original_node.body = instrumentation_nodes + original_node.body
+                    node = original_node
+                else:
+                    node = original_node
+        return node
 
     def get_instrumented_elements(self) -> Dict:
         """Get information about instrumented elements from all strategies"""
@@ -313,9 +354,28 @@ class CoverageReporter:
     def generate_branch_report(
         source_file: str, coverage_data: Dict, instrumented_branches: Set[str]
     ) -> str:
-        """Generate a branch coverage report (placeholder for future implementation)"""
-        # This is a placeholder for future branch coverage reporting
-        return "Branch coverage reporting will be implemented in a future version."
+        file_branches = coverage_data.get(source_file, {}).get("branches", {})
+
+        covered = 0
+        total = 0
+
+        lines = []
+        lines.append(f"Branch Coverage Report for {source_file}")
+        lines.append("=" * 60)
+
+        for branch_key, counts in file_branches.items():
+            total += 1
+            if (counts["taken"] > 0) or (counts["not_taken"] > 0):
+                covered += 1
+            lines.append(
+                f"{branch_key:20s} => taken: {counts['taken']:2d}, not_taken: {counts['not_taken']:2d}"
+            )
+
+        coverage_pct = (covered / total * 100) if total > 0 else 0
+        lines.append(f"\nTotal branches: {total}, Covered: {covered}")
+        lines.append(f"Coverage: {coverage_pct:.2f}%")
+
+        return "\n".join(lines)
 
 
 class CoverageEngine:
@@ -445,9 +505,10 @@ _coverage_tracker = CoverageTracker()
         tree = ast.parse(source, filename=str(file_path))
 
         # Create instrumentation strategies
+        path_str = str(file_path)
         available_strategies = {
-            "line": LineInstrumentationStrategy(str(file_path)),
-            # 'branch': BranchInstrumentationStrategy(str(file_path)) # Commented out until implemented
+            "line": LineInstrumentationStrategy(path_str),
+            "branch": BranchInstrumentationStrategy(path_str),
         }
 
         selected_strategies = []
@@ -548,7 +609,6 @@ spec.loader.exec_module(module)
 
 
 def main():
-    """Main function to demonstrate the POC"""
     if len(sys.argv) < 2:
         print("Usage: python coverage_tool.py <python_file_to_instrument>")
         return
@@ -570,7 +630,7 @@ def main():
     print(f"Instrumenting {source_file}...")
     try:
         instrumented_file, instrumentation_info = coverage_engine.instrument_file(
-            source_file
+            source_file, strategies=["line", "branch"]
         )
         print(f"File instrumented: {instrumented_file}")
 

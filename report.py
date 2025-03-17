@@ -112,7 +112,6 @@ def generate_colored_report(source_file, coverage_data, use_colors=True):
     # combine final report
     return "\n".join(header + line_reports)
 
-
 def main():
     import argparse
 
